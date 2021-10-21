@@ -36,31 +36,45 @@ static stack_trace_save_tsk_function stack_trace_save_tsk_ptr = NULL;
 static char stack_trace_save_tsk_symbol[64] = "stack_trace_save_tsk";
 
 #define MAX_TRACE 64
-#define MY_JHASH_INITVAL 0x42f
+#define MY_JHASH_INITVAL 0x42fa5542
 
 struct stack_trace {
 	unsigned long trace[MAX_TRACE];
 	unsigned int trace_length;
 };
 
-static DEFINE_SPINLOCK(ht_lock);
-static DEFINE_HASHTABLE(task_table, 8);
-struct ht_entry {
-	struct hlist_node hash;
-	unsigned long long cycles_running;
-	unsigned long long last_tsc;
-	struct stack_trace st;
-	int is_user;
-};
-
+/*
+ * Tree definitions
+ */
 static DEFINE_SPINLOCK(tree_lock);
 static struct rb_root task_tree = RB_ROOT;
 struct rb_entry {
         struct rb_node node;
         unsigned long long cycles_running;
+	unsigned long long last_tsc;
 	struct stack_trace st;
 	int is_user;
 };
+
+static void insert_to_task_tree(struct rb_entry *new_entry)
+{
+	struct rb_node **link = &task_tree.rb_node;
+        struct rb_node *parent = NULL;
+        struct rb_entry *entry;
+
+        while(*link) {
+                parent = *link;
+                entry = rb_entry(parent, struct rb_entry, node);
+                if(new_entry->cycles_running < entry->cycles_running) {
+                        link = &parent->rb_left;
+                } else {
+                        link = &parent->rb_right;
+                }
+        }
+
+        rb_link_node(&new_entry->node, parent, link);
+        rb_insert_color(&new_entry->node, &task_tree);
+}
 
 static int traces_equal(struct stack_trace *t1, struct stack_trace *t2)
 {
@@ -76,14 +90,15 @@ static int traces_equal(struct stack_trace *t1, struct stack_trace *t2)
     return 1;
 }
 
-static void destroy_hash_table_and_free(void)
+static void destroy_tree_and_free(void)
 {
-	struct ht_entry *e;
-	int cursor;
-	struct hlist_node *t;
-	hash_for_each_safe(task_table, cursor, t, e, hash) {
-		hash_del(&e->hash);
-		kfree(e);
+	struct rb_node *iterator = rb_first(&task_tree);
+	struct rb_entry *tmp;
+	while(iterator) {
+		tmp = rb_entry(iterator, struct rb_entry, node);
+		iterator = rb_next(iterator);
+		rb_erase(&tmp->node, &task_tree);
+		kfree(tmp);
 	}
 }
 
@@ -183,9 +198,10 @@ static unsigned int stack_trace_save_user_tsk(struct task_struct *tsk, unsigned 
 
 static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct ht_entry *cur;
-	struct ht_entry *new_entry;
+	struct rb_entry *new_entry;
 	u32 trace_jhash;
+	struct rb_node *iterator;
+	struct rb_entry *tmp;
 	/*
 	 * Get second parameter to pick_next_task_fair from register parameter 2 (si on x86-64)
 	 */
@@ -195,12 +211,12 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	/*
 	 * Find this task's entry in the hash table
 	 */
-	spin_lock(&ht_lock);
+	spin_lock(&tree_lock);
 
 	/*
 	 * Get the stack trace
 	 */
-	new_entry = (struct ht_entry*)kmalloc(sizeof(struct ht_entry), GFP_ATOMIC);
+	new_entry = (struct rb_entry*)kmalloc(sizeof(struct rb_entry), GFP_ATOMIC);
 	new_entry->is_user = (prev->mm != NULL);
 	if(new_entry->is_user) {
                 new_entry->st.trace_length = stack_trace_save_user_tsk(prev, new_entry->st.trace, MAX_TRACE, 0);
@@ -214,52 +230,64 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	/*
 	 * Search for the scheduled stack trace
 	 */
-	hash_for_each_possible(task_table, cur, hash, (long)trace_jhash) {
-                if(traces_equal(&cur->st, &new_entry->st)) {
+	iterator = rb_first(&task_tree);
+        while(iterator) {
+                tmp = rb_entry(iterator, struct rb_entry, node);
+                if(traces_equal(&tmp->st, &new_entry->st)) {
 			/*
-			 * Schedule out
+			 * Update the old node's counter if valid
 			 */
-                        if(cur->last_tsc != 0) {
-				cur->cycles_running += (rdtsc() - cur->last_tsc);
-				cur->last_tsc = 0;
-			}
-			kfree(new_entry);
-                        spin_unlock(&ht_lock);
-                        return 0;
-                }
+			if(tmp->last_tsc != 0) {
+                                tmp->cycles_running += (rdtsc() - tmp->last_tsc);
+                                tmp->last_tsc = 0;
+                        }
+			/*
+			 * Copy the old data to the new node
+			 */
+			new_entry->cycles_running = tmp->cycles_running;
+			new_entry->last_tsc = 0;
+
+			/*
+			 * Swap out the nodes
+			 */
+			rb_erase(iterator, &task_tree);
+			kfree(iterator);
+			insert_to_task_tree(new_entry);
+			spin_unlock(&tree_lock);
+			return 0;
+		}
+		iterator = rb_next(iterator);
         }
 
 	/*
 	 * Create a new entry
 	 */
+	new_entry->cycles_running = 0;
 	new_entry->last_tsc = 0;
-	/*
-	 * We don't know how long this task has already run, so just init to 0...
-	 */
-        new_entry->cycles_running = 0;
-        hash_add(task_table, &new_entry->hash, (long)trace_jhash);
-	spin_unlock(&ht_lock);
+        insert_to_task_tree(new_entry);
+	spin_unlock(&tree_lock);
 	return 0;
 }
 NOKPROBE_SYMBOL(entry_handler);
 
 static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct ht_entry *cur;
-	struct ht_entry *new_entry;
+	struct rb_entry *new_entry;
 	u32 trace_jhash;
+	struct rb_node *iterator;
+	struct rb_entry *tmp;
 	struct task_struct *task = (struct task_struct*)regs_return_value(regs);
 	if(task == NULL)
 		return 0;
 	/*
 	 * All paths modify the hash table, so acquire spinlock
 	 */
-	spin_lock(&ht_lock);
+	spin_lock(&tree_lock);
 	
 	/*
 	 * Get the stack trace
 	 */
-	new_entry = (struct ht_entry*)kmalloc(sizeof(struct ht_entry), GFP_ATOMIC);
+	new_entry = (struct rb_entry*)kmalloc(sizeof(struct rb_entry), GFP_ATOMIC);
 	new_entry->is_user = (task->mm != NULL);
 	if(new_entry->is_user) {
 		new_entry->st.trace_length = stack_trace_save_user_tsk(task, new_entry->st.trace, MAX_TRACE, 0);
@@ -274,26 +302,31 @@ static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	/*
 	 * Search for the scheduled stack trace
 	 */
-	hash_for_each_possible(task_table, cur, hash, (long)trace_jhash) {
-		if(traces_equal(&cur->st, &new_entry->st)) {
-			if(cur->last_tsc != 0) {
-				cur->cycles_running += (rdtsc() - cur->last_tsc);
+	iterator = rb_first(&task_tree);
+        while(iterator) {
+                tmp = rb_entry(iterator, struct rb_entry, node);
+                if(traces_equal(&tmp->st, &new_entry->st)) {
+			/*
+			 * If the task hasn't been scheduled in yet, make a new timestamp
+			 * indicating when it was scheduled in
+			 */
+			if(tmp->last_tsc == 0) {
+				tmp->last_tsc = rdtsc();
 			}
-			cur->last_tsc = rdtsc();
-			// TODO: Can a task stay scheduled for multiple consecutive epochs?
-			kfree(new_entry);
-			spin_unlock(&ht_lock);
-			return 0;
-		}
-	}
+			spin_unlock(&tree_lock);
+                        return 0;
+                }
+                iterator = rb_next(iterator);
+        }
+
 	/*
-	 * The scheduled PID wasn't in the hash table, so add the new entry instead
+	 * The scheduled task wasn't in the tree, so add the new entry instead
 	 * of freeing it
 	 */
 	new_entry->last_tsc = rdtsc();
 	new_entry->cycles_running = 0;
-	hash_add(task_table, &new_entry->hash, (long)trace_jhash);
-	spin_unlock(&ht_lock);
+	insert_to_task_tree(new_entry);
+	spin_unlock(&tree_lock);
 	return 0;
 }
 NOKPROBE_SYMBOL(ret_handler);
@@ -316,31 +349,41 @@ static int __kprobes kallsyms_pre(struct kprobe *p, struct pt_regs *regs)
 
 static void __kprobes kallsyms_post(struct kprobe *kp, struct pt_regs *regs, unsigned long flags)
 {
-	// nothing
+	/* nothing */
 }
 
 static int perftop_proc_show(struct seq_file *m, void *v)
 {
-	int cursor = 0;
 	int i = 0;
-	struct ht_entry *cur;
+	int j = 0;
 	unsigned long symbol_size, symbol_offset;
 	char *module_name = NULL;
 	char *current_symbol = kmalloc(sizeof(char) * KSYM_NAME_LEN, GFP_ATOMIC);
+	
+	struct rb_node *iterator = rb_last(&task_tree);
+        struct rb_entry *tmp;
+        while(iterator && i < 20) {
+                tmp = rb_entry(iterator, struct rb_entry, node);
+                i++;
+		seq_printf(m, "Rank %d scheduled task:\n", i);
+		seq_printf(m, "Jenkins hash:\t%08x\n", jhash(tmp->st.trace, tmp->st.trace_length, MY_JHASH_INITVAL));
+		seq_printf(m, "Cycles run:\t%llu (TSC ticks)\n", tmp->cycles_running);
+		seq_printf(m, "Stack trace:\n");
+		j = 0;
+		if(tmp->is_user) {
+                	for(; j < tmp->st.trace_length && j < 4; j++) {
+                        	seq_printf(m, "\t%p\n", (void*)tmp->st.trace[j]);
+                	}
+            	} else {
+                	for(; j < tmp->st.trace_length && j < 4; j++) {
+                        	seq_printf(m, "\t%s\n", kallsyms_lookup_ptr(tmp->st.trace[j], &symbol_size, &symbol_offset, &module_name, current_symbol));
+                	}
+            	}
+		if(i < 20)
+			seq_printf(m, "\n");
+                iterator = rb_prev(iterator);
+        }
 
-	hash_for_each(task_table, cursor, cur, hash) {
-	    seq_printf(m, "%llu:\n", cur->cycles_running);
-	    i = 0;
-	    if(cur->is_user) {
-	    	for(; i < cur->st.trace_length; i++) {
-	        	seq_printf(m, "\t%p\n", (void*)cur->st.trace[i]);
-		}
-	    } else {
-	    	for(; i < cur->st.trace_length; i++) {
-	        	seq_printf(m, "\t%s\n", kallsyms_lookup_ptr(cur->st.trace[i], &symbol_size, &symbol_offset, &module_name, current_symbol));
-	    	}
-	    }
-	}
 	kfree(current_symbol);
 	return 0;
 }
@@ -361,7 +404,7 @@ static int __init perftop_init(void)
 {
 	int ret;
 	
-	// Use a kprobe to get the address of kallsyms_lookup_name
+	/* Use a kprobe to get the address of kallsyms_lookup_name */
 	kallsyms_probe.pre_handler = kallsyms_pre;
 	kallsyms_probe.post_handler = kallsyms_post;
 	kallsyms_probe.offset = 0;
@@ -378,15 +421,13 @@ static int __init perftop_init(void)
 
 	unregister_kprobe(&kallsyms_probe);
 
-	// Finally, get the address of the non-exported functions
-    	// stack_trace_save_tsk
+	/* Get the address of the non-exported functions */
     	stack_trace_save_tsk_ptr = (stack_trace_save_tsk_function)kallsyms_lookup_name_ptr(stack_trace_save_tsk_symbol);
     	pr_info("Got pointer to stack_trace_save_tsk: %p\n", stack_trace_save_tsk_ptr);
 
-	// kallsyms_lookup
 	kallsyms_lookup_ptr = (kallsyms_lookup_function)kallsyms_lookup_name_ptr(kallsyms_lookup_symbol);
 
-	// Create the /proc module
+	/* Create the /proc module */
 	proc_create("perftop", 0, NULL, &perftop_proc_fops);
 
 	/*
@@ -412,7 +453,7 @@ static void __exit perftop_exit(void)
 
 	pr_info("Missed probing %d instances of %s\n", sched_retprobe.nmissed, sched_retprobe.kp.symbol_name);
 
-	destroy_hash_table_and_free();
+	destroy_tree_and_free();
 }
 
 module_init(perftop_init);
