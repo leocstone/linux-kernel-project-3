@@ -13,6 +13,8 @@
 #include <linux/spinlock.h>
 #include <linux/processor.h>
 #include <linux/sched/task_stack.h>
+#include <linux/rbtree.h>
+
 #include <asm/msr.h>
 
 MODULE_LICENSE("GPL");
@@ -36,20 +38,31 @@ static char stack_trace_save_tsk_symbol[64] = "stack_trace_save_tsk";
 #define MAX_TRACE 64
 #define MY_JHASH_INITVAL 0x42f
 
+struct stack_trace {
+	unsigned long trace[MAX_TRACE];
+	unsigned int trace_length;
+};
+
 static DEFINE_SPINLOCK(ht_lock);
-
 static DEFINE_HASHTABLE(task_table, 8);
-
 struct ht_entry {
 	struct hlist_node hash;
 	unsigned long long cycles_running;
 	unsigned long long last_tsc;
-	unsigned long trace[MAX_TRACE];
-	unsigned int trace_length;
+	struct stack_trace st;
 	int is_user;
 };
 
-static int traces_equal(struct ht_entry *t1, struct ht_entry *t2)
+static DEFINE_SPINLOCK(tree_lock);
+static struct rb_root task_tree = RB_ROOT;
+struct rb_entry {
+        struct rb_node node;
+        unsigned long long cycles_running;
+	struct stack_trace st;
+	int is_user;
+};
+
+static int traces_equal(struct stack_trace *t1, struct stack_trace *t2)
 {
     int i = 0;
     if(t1->trace_length != t2->trace_length) {
@@ -190,19 +203,19 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	new_entry = (struct ht_entry*)kmalloc(sizeof(struct ht_entry), GFP_ATOMIC);
 	new_entry->is_user = (prev->mm != NULL);
 	if(new_entry->is_user) {
-                new_entry->trace_length = stack_trace_save_user_tsk(prev, new_entry->trace, MAX_TRACE, 0);
+                new_entry->st.trace_length = stack_trace_save_user_tsk(prev, new_entry->st.trace, MAX_TRACE, 0);
         } else {
-                new_entry->trace_length = stack_trace_save_tsk_ptr(prev, new_entry->trace, MAX_TRACE, 0);
+                new_entry->st.trace_length = stack_trace_save_tsk_ptr(prev, new_entry->st.trace, MAX_TRACE, 0);
         }
 	/*
 	 * Hash stack trace
 	 */
-	trace_jhash = jhash(new_entry->trace, sizeof(unsigned long) * new_entry->trace_length, MY_JHASH_INITVAL);
+	trace_jhash = jhash(new_entry->st.trace, sizeof(unsigned long) * new_entry->st.trace_length, MY_JHASH_INITVAL);
 	/*
 	 * Search for the scheduled stack trace
 	 */
 	hash_for_each_possible(task_table, cur, hash, (long)trace_jhash) {
-                if(traces_equal(cur, new_entry)) {
+                if(traces_equal(&cur->st, &new_entry->st)) {
 			/*
 			 * Schedule out
 			 */
@@ -249,20 +262,20 @@ static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	new_entry = (struct ht_entry*)kmalloc(sizeof(struct ht_entry), GFP_ATOMIC);
 	new_entry->is_user = (task->mm != NULL);
 	if(new_entry->is_user) {
-		new_entry->trace_length = stack_trace_save_user_tsk(task, new_entry->trace, MAX_TRACE, 0);
+		new_entry->st.trace_length = stack_trace_save_user_tsk(task, new_entry->st.trace, MAX_TRACE, 0);
 	} else {
-		new_entry->trace_length = stack_trace_save_tsk_ptr(task, new_entry->trace, MAX_TRACE, 0);
+		new_entry->st.trace_length = stack_trace_save_tsk_ptr(task, new_entry->st.trace, MAX_TRACE, 0);
 	}
 
 	/*
 	 * Hash stack trace
 	 */
-	trace_jhash = jhash(new_entry->trace, sizeof(unsigned long) * new_entry->trace_length, MY_JHASH_INITVAL);
+	trace_jhash = jhash(new_entry->st.trace, sizeof(unsigned long) * new_entry->st.trace_length, MY_JHASH_INITVAL);
 	/*
 	 * Search for the scheduled stack trace
 	 */
 	hash_for_each_possible(task_table, cur, hash, (long)trace_jhash) {
-		if(traces_equal(cur, new_entry)) {
+		if(traces_equal(&cur->st, &new_entry->st)) {
 			if(cur->last_tsc != 0) {
 				cur->cycles_running += (rdtsc() - cur->last_tsc);
 			}
@@ -319,12 +332,12 @@ static int perftop_proc_show(struct seq_file *m, void *v)
 	    seq_printf(m, "%llu:\n", cur->cycles_running);
 	    i = 0;
 	    if(cur->is_user) {
-	    	for(; i < cur->trace_length; i++) {
-	        	seq_printf(m, "\t%p\n", (void*)cur->trace[i]);
+	    	for(; i < cur->st.trace_length; i++) {
+	        	seq_printf(m, "\t%p\n", (void*)cur->st.trace[i]);
 		}
 	    } else {
-	    	for(; i < cur->trace_length; i++) {
-	        	seq_printf(m, "\t%s\n", kallsyms_lookup_ptr(cur->trace[i], &symbol_size, &symbol_offset, &module_name, current_symbol));
+	    	for(; i < cur->st.trace_length; i++) {
+	        	seq_printf(m, "\t%s\n", kallsyms_lookup_ptr(cur->st.trace[i], &symbol_size, &symbol_offset, &module_name, current_symbol));
 	    	}
 	    }
 	}
